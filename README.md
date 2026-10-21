@@ -51,7 +51,7 @@ the original checkpoint :
 ## ThowiLabs extension: persistent reference-code cache
 
 This fork adds a **native persistent RVQ cache** to `omnivoice-tts` (commit
-`51e2761`). Its purpose is to avoid decoding and encoding the same reference
+`4837410`). Its purpose is to avoid decoding and encoding the same reference
 audio every time a new sentence is synthesized.
 
 ```bash
