@@ -199,6 +199,7 @@ void ov_tts_default_params(struct ov_tts_params * p) {
     p->mg_position_temperature = 5.0f;
     p->mg_class_temperature    = 0.0f;
     p->mg_seed                 = 42;
+    p->cached_ref_rms          = -1.0f;
     p->ref_audio_tokens        = nullptr;
     p->ref_T                   = 0;
     p->ref_audio_24k           = nullptr;

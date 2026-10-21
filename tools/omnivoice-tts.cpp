@@ -17,6 +17,7 @@
 #include "pipeline-codec.h"
 #include "pipeline-tts.h"
 #include "rvq-file.h"
+#include "ref-cache.h"
 #include "srt.h"
 #include "text-chunker-stream.h"
 #include "text-chunker.h"
@@ -72,6 +73,7 @@ static void print_usage(const char * prog) {
             "  --ref-wav <path>        Reference WAV for voice cloning\n"
             "  --ref-text <path>       Transcript file for the reference (required with --ref-wav / --ref-rvq)\n"
             "  --ref-rvq <path>        Pre-encoded reference codes from omnivoice-codec (replaces --ref-wav)\n"
+            "  --ref-cache-dir <dir>  Cache WAV reference as reusable RVQ codes (native SHA-256)\n"
             "  --seed <int>            Sampling seed (default: -1 for random)\n"
             "  --steps <int>           MaskGIT decode steps (default: 32, fewer is faster)\n"
             "  --no-preprocess-prompt  Skip ref-wav silence trim and ref-text terminal punctuation\n"
@@ -231,6 +233,7 @@ static int run_srt_dub(ov_context *                 ov,
                        const std::vector<float> &   ref_audio,
                        const std::vector<int32_t> & ref_tokens,
                        int                          ref_T,
+                       float                        cached_ref_rms,
                        const std::string &          ref_text,
                        const std::string &          lang,
                        const char *                 prompt_instruct,
@@ -298,6 +301,7 @@ static int run_srt_dub(ov_context *                 ov,
         p.ref_n_samples    = (int) ref_audio.size();
         p.ref_audio_tokens = ref_tokens.empty() ? nullptr : ref_tokens.data();
         p.ref_T            = ref_T;
+        p.cached_ref_rms   = cached_ref_rms;
         p.ref_text         = ref_text.c_str();
         p.dump_dir         = dump_dir;
 
@@ -379,6 +383,7 @@ static int run_tts_via_ov(const char * model_path,
                           bool         clamp_fp16,
                           const char * ref_wav_path,
                           const char * ref_rvq_path,
+                          const char * ref_cache_dir,
                           const char * ref_text_path,
                           const char * prompt_lang,
                           const char * prompt_instruct,
@@ -417,6 +422,7 @@ static int run_tts_via_ov(const char * model_path,
     std::vector<float>   ref_audio;
     std::vector<int32_t> ref_tokens;
     int                  ref_T = 0;
+    float                cached_ref_rms = -1.0f;
     std::string          ref_text;
     if (ref_text_path) {
         if (!read_text_file(ref_text_path, ref_text)) {
@@ -424,7 +430,11 @@ static int run_tts_via_ov(const char * model_path,
             return 1;
         }
     }
-    if (ref_wav_path) {
+    // Check reference cache before even opening or decoding the WAV.
+    const bool cached_reference = ref_wav_path && ref_cache_dir &&
+        refcache::lookup(ref_wav_path,codec_path,ref_cache_dir,ov,
+                         ref_tokens,ref_T,cached_ref_rms);
+    if (ref_wav_path && !cached_reference) {
         fprintf(stderr, "[CLI] Reference WAV: %s\n", ref_wav_path);
         int     n_samples = 0;
         float * raw       = audio_read_mono(ref_wav_path, 24000, &n_samples);
@@ -436,6 +446,12 @@ static int run_tts_via_ov(const char * model_path,
         }
         ref_audio.assign(raw, raw + n_samples);
         free(raw);
+        if (ref_cache_dir) {
+            if (!refcache::prepare(ref_wav_path,codec_path,ref_cache_dir,ov,
+                                   ref_audio,ref_tokens,ref_T,cached_ref_rms)) {
+                fprintf(stderr,"[RefCache] unavailable; falling back to raw WAV reference\n");
+            }
+        }
     }
     if (ref_rvq_path) {
         const int K = ov_num_codebooks(ov);
@@ -453,7 +469,7 @@ static int run_tts_via_ov(const char * model_path,
     // duration and post filtering per cue. Returns before the single text
     // streaming and buffered paths below.
     if (srt_path) {
-        rc = run_srt_dub(ov, srt_path, ref_audio, ref_tokens, ref_T, ref_text, lang, prompt_instruct, prompt_denoise,
+        rc = run_srt_dub(ov, srt_path, ref_audio, ref_tokens, ref_T, cached_ref_rms, ref_text, lang, prompt_instruct, prompt_denoise,
                          preprocess_prompt, mg_steps, seed_resolved, dump_dir, output_path, wav_fmt);
         ov_free(ov);
         return rc;
@@ -537,6 +553,7 @@ static int run_tts_via_ov(const char * model_path,
             params.ref_n_samples    = (int) ref_audio.size();
             params.ref_audio_tokens = ref_tokens.empty() ? nullptr : ref_tokens.data();
             params.ref_T            = ref_T;
+            params.cached_ref_rms   = cached_ref_rms;
             params.ref_text         = ref_text.c_str();
             params.dump_dir         = dump_dir;
             params.on_chunk         = [](const float * s, int n, void * ud) -> bool {
@@ -645,6 +662,7 @@ static int run_tts_via_ov(const char * model_path,
     params.ref_n_samples    = (int) ref_audio.size();
     params.ref_audio_tokens = ref_tokens.empty() ? nullptr : ref_tokens.data();
     params.ref_T            = ref_T;
+    params.cached_ref_rms   = cached_ref_rms;
     params.ref_text         = ref_text.c_str();
     params.dump_dir         = dump_dir;
 
@@ -688,6 +706,7 @@ static int main_impl(int argc, char ** argv) {
     const char * srt_path               = NULL;
     const char * ref_wav_path           = NULL;
     const char * ref_rvq_path           = NULL;
+    const char * ref_cache_dir          = NULL;
     const char * ref_text_path          = NULL;
     const char * output_path            = NULL;
     bool         use_fa                 = true;
@@ -734,6 +753,8 @@ static int main_impl(int argc, char ** argv) {
             ref_wav_path = argv[++i];
         } else if (strcmp(argv[i], "--ref-rvq") == 0 && i + 1 < argc) {
             ref_rvq_path = argv[++i];
+        } else if (strcmp(argv[i], "--ref-cache-dir") == 0 && i + 1 < argc) {
+            ref_cache_dir = argv[++i];
         } else if (strcmp(argv[i], "--ref-text") == 0 && i + 1 < argc) {
             ref_text_path = argv[++i];
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
@@ -785,6 +806,10 @@ static int main_impl(int argc, char ** argv) {
         fprintf(stderr, "[CLI] ERROR: synthesis requires --codec\n");
         return 1;
     }
+    if (ref_cache_dir && (!ref_wav_path || ref_rvq_path || !tts_mode || !preprocess_prompt)) {
+        fprintf(stderr,"[CLI] ERROR: --ref-cache-dir requires --ref-wav and normal reference preprocessing\n");
+        return 1;
+    }
     if (ref_wav_path && ref_rvq_path) {
         fprintf(stderr, "[CLI] ERROR: --ref-wav and --ref-rvq are mutually exclusive\n");
         return 1;
@@ -823,7 +848,7 @@ static int main_impl(int argc, char ** argv) {
     // TTS mode runs through the OmniVoice handle. Debug modes (--llm-test,
     // --maskgit-test) keep their lower-level init flow below.
     if (tts_mode) {
-        return run_tts_via_ov(model_path, codec_path, device, use_fa, clamp_fp16, ref_wav_path, ref_rvq_path,
+        return run_tts_via_ov(model_path, codec_path, device, use_fa, clamp_fp16, ref_wav_path, ref_rvq_path, ref_cache_dir,
                               ref_text_path, prompt_lang, prompt_instruct, prompt_duration_sec, prompt_denoise,
                               preprocess_prompt, chunk_duration_sec, chunk_threshold_sec, stream_by_line, srt_path,
                               mg_steps, seed_resolved, dump_dir, output_path, wav_fmt);

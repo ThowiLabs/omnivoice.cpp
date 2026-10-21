@@ -54,7 +54,7 @@ extern "C" {
 // There is no separate semver triple. The runtime build identity is the
 // git short hash + commit date string returned by ov_version(); for
 // binding compat checks, OV_ABI_VERSION is the only number that matters.
-#define OV_ABI_VERSION 4
+#define OV_ABI_VERSION 5
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -252,6 +252,11 @@ struct ov_tts_params {
     // either way. Tail field: kept last for ABI growth, read only when
     // abi_version >= 3. The streaming path always post filters.
     bool postproc;
+
+    // When providing pre-encoded RVQ ref_audio_tokens from a reference cache,
+    // restore its original unamplified RMS to retain raw-WAV loudness. Use -1
+    // for ordinary pre-encoded RVQ without known RMS. Tail field (ABI >= 5).
+    float cached_ref_rms;
 };
 
 // Initialise to the standard defaults. Strings NULL, T_override 0,
