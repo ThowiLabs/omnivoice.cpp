@@ -48,6 +48,49 @@ the original checkpoint :
 ./quantize.sh         # base LM Q8_0 (tokenizer stays at native dtype)
 ```
 
+## ThowiLabs extension: persistent reference-code cache
+
+This fork adds a **native persistent RVQ cache** to `omnivoice-tts` (commit
+`51e2761`). Its purpose is to avoid decoding and encoding the same reference
+audio every time a new sentence is synthesized.
+
+```bash
+# First run: preprocess and encode the WAV, then save its reference codes.
+printf 'Hola desde OmniVoice.\n' | build/omnivoice-tts \
+  --model models/omnivoice-base-Q8_0.gguf \
+  --codec models/omnivoice-tokenizer-Q8_0.gguf \
+  --device CUDA0 \
+  --ref-wav ref.wav --ref-text ref.txt \
+  --ref-cache-dir ./voice-cache \
+  --seed 42 --steps 32 -o first.wav
+
+# Next run: reuse the encoded reference directly (no WAV decode or codec encode).
+printf 'Esta es otra frase con la misma voz.\n' | build/omnivoice-tts \
+  --model models/omnivoice-base-Q8_0.gguf \
+  --codec models/omnivoice-tokenizer-Q8_0.gguf \
+  --device CUDA0 \
+  --ref-wav ref.wav --ref-text ref.txt \
+  --ref-cache-dir ./voice-cache \
+  --seed 42 --steps 32 -o second.wav
+```
+
+The first generation logs `[RefCache] MISS` and `[RefCache] STORED`; later
+runs log `[RefCache] HIT`. The cache survives process restarts, stores packed
+`.rvq` files rather than the original audio, is keyed to the source WAV and
+codec identity, and verifies the RVQ checksum before reuse. Corrupt entries
+are regenerated automatically. The code also preserves the original
+reference RMS on both cache hits and misses to avoid changing output
+loudness: identical text, seed and settings produce byte-identical WAVs.
+
+The cache is **opt-in**: omit `--ref-cache-dir` for standard upstream behavior.
+The option requires `--ref-wav` and the default preprocessing; do not combine
+it with `--ref-rvq` or `--no-preprocess-prompt`. Use a private cache directory
+for sensitive voice-reference data.
+
+The GPU implementation was tested with Q8_0 and Q4_K_M OmniVoice base/codec
+weights on NVIDIA Tesla T4. Models and ready-to-run CUDA binaries are
+distributed separately in [ThowiLabs/OVLC](https://huggingface.co/ThowiLabs/OVLC).
+
 ## Quick start
 
 ```
